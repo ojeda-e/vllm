@@ -94,25 +94,82 @@ def get_cgroup_memory_limit() -> int | None:
     return None
 
 
-def get_cgroup_memory_usage() -> int | None:
-    """Return the current cgroup memory usage in bytes, or None.
+_CGROUP_ROOT = "/sys/fs/cgroup"
+_V2_RECLAIMABLE_KEYS: tuple[str, ...] = (
+    "active_file",
+    "inactive_file",
+    "slab_reclaimable",
+)
+_V1_RECLAIMABLE_KEYS: tuple[str, ...] = ("total_active_file", "total_inactive_file")
 
-    The usage value is intentionally read on every call because cgroup
-    memory usage changes while the process is running.
+
+def _read_memory_stat(path: str) -> dict[str, int]:
+    """Read a cgroup ``memory.stat`` file.
+
+    Parameters
+    ----------
+    path : str
+        Path to the ``memory.stat`` file.
+
+    Returns
+    -------
+    dict[str, int]
+        Counter values by name. Empty when the file cannot be read.
+
     """
-    if sys.platform != "linux":
-        return None
+    try:
+        with open(path) as f:
+            return {
+                key: int(value)
+                for key, value in (line.split() for line in f if line.strip())
+            }
+    except (OSError, ValueError):
+        return {}
+
+
+def get_cgroup_memory_usage(cgroup_root: str | None = None) -> int | None:
+    """Return the cgroup memory usage in bytes without reclaimable memory.
+
+    The usage is read on every call because it changes while the process
+    runs. File cache and reclaimable slab memory are subtracted, because
+    the kernel frees them under memory pressure.
+
+    Parameters
+    ----------
+    cgroup_root : str, optional
+        Root of the cgroup filesystem. The default is ``/sys/fs/cgroup``
+        on Linux. On other platforms the default returns None.
+
+    Returns
+    -------
+    int or None
+        Usage in bytes, or None when no cgroup memory limit is set.
+
+    """
+    if cgroup_root is None:
+        if sys.platform != "linux":
+            return None
+        cgroup_root = _CGROUP_ROOT
 
     # cgroup v2 unified hierarchy
-    if _read_int_file("/sys/fs/cgroup/memory.max") is not None:
-        return _read_int_file("/sys/fs/cgroup/memory.current")
+    if _read_int_file(f"{cgroup_root}/memory.max") is not None:
+        usage = _read_int_file(f"{cgroup_root}/memory.current")
+        stat_path = f"{cgroup_root}/memory.stat"
+        reclaimable_keys = _V2_RECLAIMABLE_KEYS
+    else:
+        # cgroup v1
+        v1_limit = _read_int_file(f"{cgroup_root}/memory/memory.limit_in_bytes")
+        if v1_limit is None or v1_limit >= (1 << 62):
+            return None
+        usage = _read_int_file(f"{cgroup_root}/memory/memory.usage_in_bytes")
+        stat_path = f"{cgroup_root}/memory/memory.stat"
+        reclaimable_keys = _V1_RECLAIMABLE_KEYS
 
-    # cgroup v1
-    v1_limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    if v1_limit is not None and v1_limit < (1 << 62):
-        return _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-
-    return None
+    if usage is None:
+        return None
+    stats = _read_memory_stat(stat_path)
+    reclaimable = sum(stats.get(key, 0) for key in reclaimable_keys)
+    return max(0, usage - reclaimable)
 
 
 def check_cgroup_memory_available(

@@ -15,6 +15,8 @@ _V2_LIMIT_PATH = "/sys/fs/cgroup/memory.max"
 _V2_USAGE_PATH = "/sys/fs/cgroup/memory.current"
 _V1_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 _V1_USAGE_PATH = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+_V2_STAT_PATH = "/sys/fs/cgroup/memory.stat"
+_V1_STAT_PATH = "/sys/fs/cgroup/memory/memory.stat"
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +28,8 @@ def _clear_cgroup_cache():
 
 def _stub_files(monkeypatch, files: dict):
     """Stub ``open()`` for a fixed set of paths; ``None`` -> OSError."""
+    files.setdefault(_V2_STAT_PATH, None)
+    files.setdefault(_V1_STAT_PATH, None)
     real_open = open
 
     def fake_open(path, *args, **kwargs):
@@ -187,3 +191,74 @@ def test_check_cgroup_memory_available_skips_without_snapshot(
 
     log_debug.assert_not_called()
     log_warning.assert_not_called()
+
+
+class TestCgroupMemoryUsageWithoutReclaimable:
+    """Usage excludes the file cache and slab memory the kernel can reclaim."""
+
+    V2_STAT = (
+        f"anon {40 * GiB_bytes}\n"
+        f"file {18 * GiB_bytes}\n"
+        f"shmem {2 * GiB_bytes}\n"
+        f"active_file {4 * GiB_bytes}\n"
+        f"inactive_file {10 * GiB_bytes}\n"
+        f"slab_reclaimable {1 * GiB_bytes}\n"
+        f"slab_unreclaimable {1 * GiB_bytes}\n"
+    )
+    V1_STAT = (
+        f"cache {4 * GiB_bytes}\n"
+        f"active_file {1 * GiB_bytes}\n"
+        f"total_rss {40 * GiB_bytes}\n"
+        f"total_active_file {4 * GiB_bytes}\n"
+        f"total_inactive_file {10 * GiB_bytes}\n"
+    )
+
+    @staticmethod
+    def write_v2(root, usage, stat=None):
+        (root / "memory.max").write_text(f"{72 * GiB_bytes}\n")
+        (root / "memory.current").write_text(f"{usage}\n")
+        if stat is not None:
+            (root / "memory.stat").write_text(stat)
+
+    @staticmethod
+    def write_v1(root, usage, stat=None):
+        v1 = root / "memory"
+        v1.mkdir()
+        (v1 / "memory.limit_in_bytes").write_text(f"{72 * GiB_bytes}\n")
+        (v1 / "memory.usage_in_bytes").write_text(f"{usage}\n")
+        if stat is not None:
+            (v1 / "memory.stat").write_text(stat)
+
+    def test_v2_subtracts_file_lru_and_reclaimable_slab(self, tmp_path):
+        self.write_v2(tmp_path, 60 * GiB_bytes, self.V2_STAT)
+
+        usage = cru.get_cgroup_memory_usage(cgroup_root=str(tmp_path))
+
+        assert usage == 45 * GiB_bytes
+
+    def test_v1_subtracts_hierarchical_file_lru(self, tmp_path):
+        self.write_v1(tmp_path, 60 * GiB_bytes, self.V1_STAT)
+
+        usage = cru.get_cgroup_memory_usage(cgroup_root=str(tmp_path))
+
+        assert usage == 46 * GiB_bytes
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_missing_stat_keeps_raw_usage(self, tmp_path, version):
+        getattr(self, f"write_{version}")(tmp_path, 60 * GiB_bytes)
+
+        usage = cru.get_cgroup_memory_usage(cgroup_root=str(tmp_path))
+
+        assert usage == 60 * GiB_bytes
+
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    def test_reclaimable_above_usage_clamps_to_zero(self, tmp_path, version):
+        stat = self.V1_STAT if version == "v1" else self.V2_STAT
+        getattr(self, f"write_{version}")(tmp_path, 1 * GiB_bytes, stat)
+
+        usage = cru.get_cgroup_memory_usage(cgroup_root=str(tmp_path))
+
+        assert usage == 0
+
+    def test_no_limit_files_returns_none(self, tmp_path):
+        assert cru.get_cgroup_memory_usage(cgroup_root=str(tmp_path)) is None
